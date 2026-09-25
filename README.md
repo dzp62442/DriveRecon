@@ -29,10 +29,15 @@
 ```bash
 git clone https://github.com/EnVision-Research/DriveRecon.git --recursive
 cd DriveRecon
-conda env create -f environment.yml
 
-pip install -e submodules/depth-diff-gaussian-rasterization
-pip install -e submodules/simple-knn
+conda create -n drivingrecon python=3.9 pip -y
+conda activate drivingrecon
+
+pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt --no-build-isolation
+
+pip install -e submodules/diff-surfel-rasterization --no-build-isolation
+pip install -e submodules/simple-knn --no-build-isolation
 ```
 
 ### Preparing Dataset

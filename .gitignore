@@ -1,0 +1,55 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.cache/
+.venv/
+venv/
+
+# Python packaging and C++/CUDA extension builds
+build/
+dist/
+*.egg-info/
+.eggs/
+*.so
+*.so.*
+*.pyd
+*.o
+*.obj
+*.a
+.ninja_deps
+.ninja_log
+
+# Local datasets (keep data/waymo_splits/ under version control)
+/data/waymo
+
+# Model weights and checkpoints
+/checkpoints/
+/weights/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Training, evaluation, and visualization outputs
+/Temp/
+/output/
+/outputs/
+/logs/
+/runs/
+/wandb/
+/test/*.ply
+*.log
+events.out.tfevents.*
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
