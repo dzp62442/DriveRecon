@@ -40,6 +40,20 @@ pip install -e submodules/diff-surfel-rasterization --no-build-isolation
 pip install -e submodules/simple-knn --no-build-isolation
 ```
 
+### OmniScene 对比实验
+
+静态六相机实验协议及实现细节见 [OmniScene 数据集实验文档](docs/OmniScene%20数据集实验文档.md)。
+
+```bash
+python train_omniscene.py --config configs/omniscene/112x200.py --print-config
+CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/112x200.py --mode train
+CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x400.py --mode train
+
+CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/112x200.py --mode test --test-split total --checkpoint final
+CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x400.py --mode test --test-split total --checkpoint final
+```
+
+
 ### Preparing Dataset
 Follow detailed instructions in [Prepare Dataset](docs/prepare_data.md). 
 

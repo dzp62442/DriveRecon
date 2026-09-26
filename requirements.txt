@@ -5,6 +5,7 @@ huggingface-hub==0.24.1
 imageio==2.34.1
 imageio-ffmpeg==0.5.1
 kiui==0.2.11
+lpips==0.1.4
 mediapy==1.2.2
 mmcv==1.6.0
 open3d==0.16.0

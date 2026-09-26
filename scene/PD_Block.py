@@ -129,6 +129,17 @@ class Cluster(nn.Module):
             x = self.f(x)
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
         value = rearrange(value, "b (e c) w h -> (b e) c w h", e=self.heads)
+        original_shape = x.shape[-2:]
+        valid = None
+        if self.fold_w > 1 and self.fold_h > 1 and getattr(self, "allow_padding", False):
+            pad_h = (-x.shape[-2]) % self.fold_w
+            pad_w = (-x.shape[-1]) % self.fold_h
+            if pad_h or pad_w:
+                padding = (0, pad_w, 0, pad_h)
+                valid = F.pad(torch.ones_like(x[:, :1]), padding)
+                x, value = F.pad(x, padding), F.pad(value, padding)
+                if xyz is not None:
+                    xyz = F.pad(xyz, padding)
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
             b0, c0, w0, h0 = x.shape
@@ -137,14 +148,23 @@ class Cluster(nn.Module):
             x = rearrange(x, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w,
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
+            if valid is not None:
+                valid = rearrange(valid, "b c (f1 w) (f2 h) -> (b f1 f2) c w h",
+                                  f1=self.fold_w, f2=self.fold_h)
             if xyz != None:
                 xyz = rearrange(xyz, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
 
         b, c, w, h = x.shape
-        centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
+        def pool(tensor):
+            if valid is None:
+                return self.centers_proposal(tensor)
+            mask = valid[:tensor.shape[0]]
+            return self.centers_proposal(tensor * mask) / self.centers_proposal(mask).clamp_min(1e-6)
+
+        centers = pool(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         if xyz != None:
-            xyz_center = self.centers_proposal(xyz)
-        value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
+            xyz_center = pool(xyz)
+        value_centers = rearrange(pool(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
         b, c, ww, hh = centers.shape
         if xyz==None:
             sim = torch.sigmoid(
@@ -171,6 +191,10 @@ class Cluster(nn.Module):
             sim_geo = sim_geo.repeat(int(sim.shape[0]/sim_geo.shape[0]), 1, 1)
             sim = torch.mul(sim, sim_geo**2)
 
+
+        if valid is not None:
+            center_valid = (self.centers_proposal(valid).flatten(2) > 0).transpose(1, 2)
+            sim = sim * valid.flatten(2) * center_valid
 
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
@@ -200,6 +224,7 @@ class Cluster(nn.Module):
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
+        out = out[..., :original_shape[0], :original_shape[1]]
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
         out = self.act(self.proj(self.norm(out)))
         return out
@@ -268,7 +293,7 @@ class PD_Block(nn.Module):
                                         nn.Conv2d(dim, out_dim, groups=int(min(dim, out_dim)/4), kernel_size=1),
                                         nn.SiLU())
         if self.geo_flag == True:
-            self.depth_act = lambda x: 0.5 * torch.tanh(x).cuda() + 0.5
+            self.depth_act = lambda x: 0.5 * torch.tanh(x) + 0.5
             self.position_fusion = nn.Sequential(
                 nn.BatchNorm2d(dim + 3),
                 nn.Conv2d(dim + 3, dim, kernel_size=9, stride=1, padding=4),
@@ -304,16 +329,24 @@ class PD_Block(nn.Module):
         BTV, C, H, W = x.shape
         B = int(BTV / self.view_num)
         if self.geo_flag:
-            Depth_pre = 255.0 * self.depth_act(x[:, 0, :, :])
-            H_d, W_d = depths.shape[-2:]
-            depths = depths.reshape(BTV, 1, H_d, W_d)
-            depths = depths.to(torch.bfloat16)
-            depths = F.interpolate(depths, size=(H, W), mode='bilinear', align_corners=False).squeeze(1)
-            depths = depths.to(torch.bfloat16)
-            mask = depths > 0.1
-            depths = depths * 255.0
-            depths_loss_reg = compute_depth("l2", Depth_pre[mask], depths[mask]) / 255.0
-            xyz = self.depth2xyz(Depth_pre, intri, extri, N=BTV, H=H, W=W)
+            if getattr(self, "static_geometry", False):
+                from scene.geometry import backproject
+                Depth_pre = 255.0 * self.depth_act(x[:, 0].float())
+                xyz = backproject(Depth_pre, intri, extri).permute(0, 3, 1, 2)
+                # Return the prediction; labels are consumed only by the loss module.
+                depths_loss_reg = Depth_pre
+                xyz = xyz.to(x.dtype)
+            else:
+                Depth_pre = 255.0 * self.depth_act(x[:, 0, :, :])
+                H_d, W_d = depths.shape[-2:]
+                depths = depths.reshape(BTV, 1, H_d, W_d)
+                depths = depths.to(torch.bfloat16)
+                depths = F.interpolate(depths, size=(H, W), mode='bilinear', align_corners=False).squeeze(1)
+                depths = depths.to(torch.bfloat16)
+                mask = depths > 0.1
+                depths = depths * 255.0
+                depths_loss_reg = compute_depth("l2", Depth_pre[mask], depths[mask]) / 255.0
+                xyz = self.depth2xyz(Depth_pre, intri, extri, N=BTV, H=H, W=W)
             geo = torch.cat([xyz/255.0, x], dim=1)
             # feats = feats.reshape(B, self.view_num, C+3, H, W).permute(0, 2, 3, 1, 4).reshape(B, C+3, H, W * self.view_num)
             x = x + self.position_fusion(geo)
@@ -322,7 +355,7 @@ class PD_Block(nn.Module):
             xyz = None
         x = x.reshape(B, self.view_num, C, H, W).permute(0, 2, 3, 4, 1).reshape(B, C, H, W * self.view_num)
         if self.dim !=self.out_dim:
-            x = self.reduce(x) + self.con_alpha * self.token_mixer(self.norm1(x))
+            x = self.reduce(x) + self.con_alpha * self.token_mixer(self.norm1(x), xyz)
         else:
             x = x + self.con_alpha * self.token_mixer(self.norm1(x), xyz)
         x = self.ResnetBlock(x)

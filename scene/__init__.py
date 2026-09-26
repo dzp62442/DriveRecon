@@ -8,17 +8,26 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from __future__ import annotations
+
 import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
-from scene.GS_LRM import Gaussian_LRM
 from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from torch.nn import functional as F
 import torch
+
+def __getattr__(name):
+    # Neural layers can be imported on CPU without loading the Waymo/CUDA stack.
+    if name == "GaussianModel":
+        from scene.gaussian_model import GaussianModel
+        return GaussianModel
+    if name == "Gaussian_LRM":
+        from scene.GS_LRM import Gaussian_LRM
+        return Gaussian_LRM
+    raise AttributeError(name)
+
 
 class Scene:
 
@@ -37,6 +46,9 @@ class Scene:
         """b
         :param path: Path to colmap scene main folder.
         """
+        from scene.dataset_readers import sceneLoadTypeCallbacks
+        from utils.camera_utils import cameraList_from_camInfos
+
         self.model_path = args.model_path
         self.gaussians = gaussians
         # for waymo

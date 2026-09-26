@@ -344,11 +344,15 @@ class MidBlock(nn.Module):
 
     def forward(self, x, intri=None, extri=None, depths=None):
         x = self.nets[0](x)
-        loss = 0
+        static_geometry = getattr(self, "static_geometry", False)
+        loss = [] if static_geometry else 0
         for attn, net in zip(self.attns, self.nets[1:]):
             for subnet in net:
                 x, depth_loss = subnet(x, intri, extri, depths)
-                loss += depth_loss
+                if static_geometry:
+                    loss.append(depth_loss)
+                else:
+                    loss += depth_loss
             if attn:
                 x = attn(x)
         return x, loss
@@ -566,6 +570,9 @@ class UNet(nn.Module):
                     [False, False, True], [False, False, True], [False, False, True], [False, False, False]),
             layers_per_block: int = 1,
             skip_scale: float = np.sqrt(0.5),
+            view_num: int = 3,
+            num_frames: int = 3,
+            static_geometry: bool = False,
     ):
         super().__init__()
 
@@ -609,9 +616,26 @@ class UNet(nn.Module):
                 skip_scale=skip_scale,
             ))
         self.up_blocks = nn.ModuleList(up_blocks)
+        self.static_geometry = static_geometry
+        self.mid_block.static_geometry = static_geometry
+        for module in self.modules():
+            if isinstance(module, PD_Block):
+                module.view_num = view_num
+                module.time_length = num_frames
+                module.static_geometry = static_geometry
+                module.token_mixer.allow_padding = static_geometry
+            if isinstance(module, TCAttention):
+                module.view_num = view_num
+                module.num_frames = num_frames
+                # Same attention equation, without materializing the N x N matrix.
+                module.attn.use_sdpa = static_geometry
 
-    def forward(self, x, intrinsics, c2ws, depths):
-        x = x.to(torch.bfloat16)
+    def forward(self, x, intrinsics, c2ws, depths=None):
+        input_shape = x.shape[-2:]
+        if not self.static_geometry:
+            x = x.to(torch.bfloat16)
+        else:
+            x = x.to(self.conv_in.weight.dtype)
         x = self.conv_in(x)
 
         # down
@@ -621,7 +645,12 @@ class UNet(nn.Module):
             xss.extend(xs)
 
         # mid
-        x, loss= self.mid_block(x, intrinsics, c2ws, depths)
+        if self.static_geometry:
+            from scene.geometry import scale_intrinsics
+            mid_intrinsics = scale_intrinsics(intrinsics, input_shape, x.shape[-2:])
+        else:
+            mid_intrinsics = intrinsics
+        x, loss = self.mid_block(x, mid_intrinsics, c2ws, depths)
         # breakpoint()
         # up
         for block in self.up_blocks:

@@ -41,6 +41,8 @@ dist/
 /logs/
 /runs/
 /wandb/
+/work_dirs/
+/datasets/omniscene
 /test/*.ply
 *.log
 events.out.tfevents.*
