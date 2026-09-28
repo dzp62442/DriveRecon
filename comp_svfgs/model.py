@@ -20,7 +20,7 @@ class StaticDriveRecon(nn.Module):
             cfg['unet']['out_channels'], cfg['num_samples'], cfg['gaussian_scale_min'],
             cfg['gaussian_scale_max'], cfg['seg_num'])
         self.adapter.max_shift = cfg['max_shift']
-        dtype_name = cfg.get('parameter_dtype', 'bfloat16')
+        dtype_name = cfg.get('parameter_dtype', 'float32')
         if dtype_name not in ('bfloat16', 'float32'):
             raise ValueError('parameter_dtype must be bfloat16 or float32')
         self.unet.to(dtype=getattr(torch, dtype_name))

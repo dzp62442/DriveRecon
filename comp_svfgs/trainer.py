@@ -8,12 +8,14 @@ import torch
 
 from .camera import target_cameras
 from .checkpoint import save_checkpoint, load_checkpoint, resolve_checkpoint
+from .diagnostics import UpdateProbe, prediction_diagnostics
 from .losses import auxiliary_losses, rgb_loss
 from .model import parameter_counts
+from .optimizer import optimizer_name
 from .runtime import append_jsonl, atomic_json, move_to_device, preserve_rng
 
 
-def train_update(model, renderer, batch, optimizer, accelerator, cfg):
+def train_update(model, renderer, batch, optimizer, accelerator, cfg, diagnose=False):
     optimizer.zero_grad(set_to_none=True)
     with accelerator.autocast():
         output = model(batch['context'])
@@ -35,8 +37,11 @@ def train_update(model, renderer, batch, optimizer, accelerator, cfg):
         photo += float(loss.detach())
     surrogate = aux + sum((value * gradients[key]).sum() for key, value in output['gaussians'].items())
     accelerator.backward(surrogate)
+    probe = UpdateProbe(accelerator.unwrap_model(model)) if diagnose else None
     optimizer.step()
     logged = {key: float(value.detach()) for key, value in losses.items()}
+    if probe is not None:
+        logged['diagnostics'] = probe.finish(accelerator.unwrap_model(model), optimizer)
     return dict(logged, rgb=photo, total=photo+float(aux.detach()), lr=optimizer.param_groups[0]['lr'])
 
 
@@ -44,6 +49,8 @@ def train_update(model, renderer, batch, optimizer, accelerator, cfg):
 def validate(model, renderer, loader, accelerator, cfg):
     was_training = model.training
     totals, count = {}, 0
+    health_rows, health_totals = [], {}
+    diagnose = cfg.get('diagnostics', {}).get('enabled', False)
     with preserve_rng():
         model.eval()
         try:
@@ -51,6 +58,11 @@ def validate(model, renderer, loader, accelerator, cfg):
                 batch = move_to_device(batch, accelerator.device)
                 with accelerator.autocast():
                     output = model(batch['context'])
+                if diagnose:
+                    health = prediction_diagnostics(output)
+                    health_rows.append(dict(bin_token=batch['bin_token'][0], statistics=health))
+                    for key, value in health.items():
+                        health_totals[key] = health_totals.get(key, 0.) + value
                 auxiliary, losses = auxiliary_losses(output, batch['context'], cfg['loss'], cfg['model'])
                 photo = 0.
                 for i, camera in enumerate(target_cameras(batch['target'], cfg['renderer'])):
@@ -63,7 +75,11 @@ def validate(model, renderer, loader, accelerator, cfg):
                 count += 1
         finally:
             model.train(was_training)
-    return dict(num_bins=count, losses={key: value/count for key, value in totals.items()})
+    result = dict(num_bins=count, losses={key: value/count for key, value in totals.items()})
+    if diagnose:
+        result['diagnostics'] = dict(mean_per_bin={key: value/count for key, value in health_totals.items()},
+                                     per_bin=health_rows)
+    return result
 
 
 class Trainer:
@@ -77,6 +93,7 @@ class Trainer:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.step = 0
         self.checkpoint = None
+        self.checkpoint_step = None
         self.events = dict(last_val_step=0, validation_count=0, last_mini_step=0,
                            final_mini_complete=False, complete=False)
         self.start_step, self.started = 0, perf_counter()
@@ -92,14 +109,19 @@ class Trainer:
             state = load_checkpoint(path, self.accelerator.unwrap_model(self.model), self.optimizer,
                                     self.sampler, self.cfg, self.accelerator.scaler)
             self.step, self.events, self.checkpoint = state['global_step'], state['events'], path
+            self.checkpoint_step = self.step
             logging.info('Resumed complete training state: %s (step %s)', path, self.step)
 
     def save(self):
         self.checkpoint = save_checkpoint(self.work_dir, self.step, self.accelerator.unwrap_model(self.model),
                                           self.optimizer, self.sampler, self.events, self.cfg, self.accelerator.scaler)
+        self.checkpoint_step = self.step
 
     def persist_events(self):
-        atomic_json(self.checkpoint / 'events.json', self.events)
+        # Validation can run between snapshots. Never attach newer events to older weights:
+        # recovery must replay those unsaved optimizer steps AND their validation events.
+        if self.checkpoint is not None and self.checkpoint_step == self.step:
+            atomic_json(self.checkpoint / 'events.json', self.events)
 
     def log(self, kind, values):
         append_jsonl(self.work_dir / 'metrics.jsonl', dict(kind=kind, step=self.step, **values))
@@ -110,9 +132,13 @@ class Trainer:
     def run_validation(self):
         result = validate(self.model, self.renderer, self.val_loader, self.accelerator, self.cfg)
         atomic_json(self.work_dir / 'validation' / f'step-{self.step:08d}' / 'summary.json', result)
-        self.log('validation', result['losses'])
+        values = dict(result['losses'])
+        values.update({'diagnostics/' + k: v for k, v in result.get('diagnostics', {}).get('mean_per_bin', {}).items()})
+        self.log('validation', values)
 
     def run_mini(self, reason):
+        if self.checkpoint_step != self.step:
+            self.save()  # Only needed when a custom mini cadence falls between checkpoints.
         path = self.work_dir / 'evaluation/mini' / f'step-{self.step:08d}' / reason
         summary = self.evaluator(self.mini_loader, 'mini', self.step, path, self.checkpoint)
         flat = {group + '/' + metric: value for group, row in summary['groups'].items()
@@ -159,9 +185,12 @@ class Trainer:
         self.start_step, self.started = self.step, perf_counter()
         counts = parameter_counts(self.accelerator.unwrap_model(self.model))
         atomic_json(self.work_dir / 'parameter_counts.json', counts)
+        active_optimizer = optimizer_name(self.optimizer)
+        logging.info('Optimizer: %s, settings: %s', active_optimizer, self.cfg['optimizer'])
         self.notify('DriveRecon 训练启动', '\n'.join([
             f'工作目录：{self.work_dir}', f'分辨率：{self.cfg["image_shape"]}',
             f'迭代次数：{self.step}/{maximum}', f'恢复来源：{self.checkpoint or "随机初始化"}',
+            f'优化器：{active_optimizer}，配置：{self.cfg["optimizer"]}',
             f'设备：{self.accelerator.device}', f'参数：{counts}']))
         self.due_events()  # Recover events interrupted after the optimizer snapshot.
         self.model.train()
@@ -174,15 +203,25 @@ class Trainer:
                 iterator = iter(self.train_loader)
                 batch = next(iterator)
             batch = move_to_device(batch, self.accelerator.device)
-            values = train_update(self.model, self.renderer, batch, self.optimizer, self.accelerator, self.cfg)
+            next_step = self.step + 1
+            diagnose = self.cfg.get('diagnostics', {}).get('enabled', False) and (
+                next_step == 1 or next_step == maximum or
+                next_step % self.cfg['training']['validate_every_steps'] == 0)
+            values = train_update(self.model, self.renderer, batch, self.optimizer, self.accelerator, self.cfg,
+                                  diagnose=diagnose)
             self.sampler.advance()
             self.step += 1
+            health = values.pop('diagnostics', None)
             self.log('train', values)
+            if health is not None:
+                atomic_json(self.work_dir / 'diagnostics' / f'step-{self.step:08d}' / 'update.json', health)
+                self.log('health', health)
             if self.step % self.cfg['training']['log_every_steps'] == 0 or self.step == 1:
                 logging.info('step %d/%d loss=%.6f lr=%.6g', self.step, maximum, values['total'], values['lr'])
             validation_due = self.step % self.cfg['training']['validate_every_steps'] == 0
-            if validation_due or self.step % self.cfg['training']['checkpoint_every_steps'] == 0:
+            if self.step % self.cfg['training']['checkpoint_every_steps'] == 0:
                 self.save()
+            if validation_due:
                 self.due_events()
         self.save()
         atomic_json(self.work_dir / 'final.json', dict(checkpoint=str(self.checkpoint.relative_to(self.work_dir)), step=self.step))

@@ -1,7 +1,7 @@
 # OmniScene 数据集实验文档
 
-> 状态：已按确认方案实现，并完成 CPU 协议测试与有界 CUDA 验证；未启动正式训练或全量评估。
-> 第 1–11 节描述确认的实验协议，第 12 节记录 2026-09-26 的实现、验证和运行依赖。
+> 状态（2026-09-28）：修复光栅器反向后的 FP32+AdamW 实验已完成 100,001 步及 30,080-bin total。本次审查恢复原版 Adam 的候选配置，4k 已出现辅助几何深度退化；用户据此确认保留 FP32 参数/动量和 AdamW 两项稳定性例外。默认配置仍与已完成实验一致，其余模型、损失和学习率设置按发布代码及既定静态协议。
+> 第 1–11 节为当前协议；第 12–15 节保留各轮排障历史；第 16 节记录发布代码一致性审查、Adam 回退诊断及用户最终决定。用户已授权 GPU 显存占用低于 1 GB 时进行有界调试。
 > 代码核对日期：2026-09-25。DriveRecon：`comp_svfgs@17e25e6`；SVF-GS：`af39b31`；depthsplat：`405b9a5`。
 
 ## 1. 实验目标与已确认选择
@@ -112,11 +112,12 @@ work_dirs/omniscene/driverecon_static_t1_224x400/
 | validate_every_steps | 1_000；使用 step 控制，不再叠加 0.01 epoch 触发器 |
 | mini_every_n_validations | 10，即正常训练在 10k、20k、…、100k 后评估 mini |
 | final_mini_test | True，在完成第 100_001 次更新之后单独执行 |
-| checkpoint_every_steps | 1_000；最后一步另存；每次 mini 前有可恢复的训练状态 |
+| checkpoint_every_steps | 5_000；最后一步 100_001 另存；验证本身不触发权重保存，默认每次 mini 前仍有对应步的完整状态 |
 | use_dynamic_mask | True，只影响训练/验证损失，不屏蔽正式图像指标 |
 | shuffle | train=True；val/mini/total=False |
-| precision / parameter_dtype | BF16 计算、BF16 网络参数，显式 `model.parameter_dtype=bfloat16`；深度采样点、几何变换、softmax、光栅接口及指标为 FP32 |
-| optimizer | Adam；UNet 和 adapter 两组均 lr=4e-4、weight_decay=0.05；betas=(0.9,0.999)、eps=1e-15 |
+| precision / parameter_dtype | `precision=bf16`，`model.parameter_dtype=float32`：FP32 参数、梯度累积与 AdamW 动量，前向使用 BF16 autocast；深度采样点、几何变换、softmax、光栅接口及指标保留 FP32 |
+| diagnostics.enabled | True；第 1 步、每次验证对应的更新步、最终更新步记录参数更新；每次验证记录全部验证 bin 的深度分布 |
+| optimizer | `type='AdamW'`，作为用户确认的稳定性例外保留；UNet 和 adapter 两组均 lr=4e-4、weight_decay=0.05、betas=(0.9,0.999)、eps=1e-15；保留理由是修正反向后恢复 Adam 仍发生辅助深度退化，而非仅因论文如此，见第 16 节 |
 | lr_scheduler | constant；原代码虽创建衰减函数，实际循环没有调用，不引入 SVF-GS 的 warmup |
 | gradient_clip | 不新增裁剪策略，沿用当前有效训练路径 |
 | initialization | 无恢复状态时随机初始化；不加载其他方法的预训练权重 |
@@ -125,7 +126,7 @@ work_dirs/omniscene/driverecon_static_t1_224x400/
 | feishu.enabled | True，通过已有 `send_feishu` 模块发送启动和 mini 完成通知 |
 | resume | auto，恢复当前 work_dir 中最新完整训练状态 |
 
-这里的 BF16 不应依赖构造函数中的裸 `.cuda()`；设备由入口统一管理，避免逻辑设备编号错误。实现时记录参数/计算精度，不把精度更改、学习率调优混入本次适配。
+设备由入口统一管理，不依赖构造函数中的裸 `.cuda()`。保留第 15 节已经数值验证的原生反向修复，以及用户在第 16 节审查后确认的 FP32 参数/动量和 AdamW 两项稳定性例外。不把论文与代码不一致本身视为 bug，也不因此更改其他模型、损失或学习率调度。
 
 ### 3.3 模型与 renderer 配置
 
@@ -146,6 +147,7 @@ work_dirs/omniscene/driverecon_static_t1_224x400/
 | 分割 | seg_num=3，保留头形状；仅监督静态/动态两种已有类别，不生成天空标签 |
 | 位置偏移 | max_shift=5；保留用于静态重建的 uv_shift；means_shift 的运动部分不作用于坐标 |
 | 渲染 | 原 2D Gaussian/surfel 光栅器，coarse 路径、黑色背景、RGB 颜色预计算、compute_cov3D_python=False |
+| 光栅器反向版本 | `renderer.aabb_backward_version=1`；修正投影中心 VJP，与原前向的 cutoff=3 保持一致，见第 15 节；启动时核对实际加载的原生扩展版本 |
 
 原上采样构造函数的 attention 标志数组有 4 项，而实际只有 3 个 up block；配置需表达实际用到的三项，不能凭配置字面再增加一个模块。原属性头内部的通道复用也先按当前代码保留，不顺带重设计 adapter。
 
@@ -334,11 +336,13 @@ while global_step < 100_001:
     train_one_optimizer_update(batch)
     global_step += 1
 
-    if global_step % 1_000 == 0:
+    if global_step % 5_000 == 0:
         save_training_state()
+
+    if global_step % 1_000 == 0:
         validate(val_loader)
         validation_count += 1
-        persist_validation_state()
+        persist_events_only_if_checkpoint_matches_current_step()
         if validation_count % 10 == 0:
             evaluate_mini(reason='periodic')
             persist_evaluation_state_and_notify()
@@ -351,6 +355,8 @@ mark_training_and_final_mini_complete()
 
 正常完成时有 100 次周期验证、10 次周期 mini，再加最终第 100_001 步的 1 次 mini。原项目没有完整的训练中 mini 功能；本次实现仍补齐，以满足用户要求的最终 mini，并统一周期评估路径。
 
+完整权重只在 5k、10k、…、100k 和 100,001 保存，共 21 份。1k、2k 等验证只写轻量 JSON/日志，不复制权重。若手动配置使 mini 步数不落在保存步上，mini 前补存同一步的状态以保证恢复和评估来源正确；默认配置不会额外增加权重份数。
+
 验证聚合全部 10 个 bin，不只保留最后一个 batch。mini/total 复用同一个 evaluator；评估前切 eval/no_grad，结束恢复 train。评估和可视化消耗的随机状态不改变训练采样序列。
 
 ### 6.2 自动恢复
@@ -360,7 +366,7 @@ mark_training_and_final_mini_complete()
 恢复内容包括：
 
 - UNet、adapter 及所有保留模块的参数/buffer；
-- Adam 状态、学习率状态、混合精度状态（如实际使用）；
+- 优化器类型、动量、学习率状态、混合精度状态（如实际使用）；
 - global_step、epoch、epoch 内 batch 游标及 sampler/generator 状态；
 - Python、NumPy、Torch CPU/CUDA RNG；
 - validation_count、最近完成的 val/mini step、待完成评估事件、final_mini 完成标记。
@@ -368,6 +374,10 @@ mark_training_and_final_mini_complete()
 只加载模型权重不能算自动续训。原 `Gaussian_LRM.capture/restore` 的不完整状态路径不作为新协议的恢复来源，也不自动混用另一个分辨率的 checkpoint。
 
 恢复后先完成已经到达触发点但尚未完成的验证/mini，再继续训练，避免在 10k 保存后中断就漏掉 mini。若已训练到 100_001、但 final_mini 未完成，只补最终 mini；若训练和最终 mini 都完成，直接报告已完成，不再多训一步。中途被打断的评估可以从该 split 开头重跑，并覆盖同一事件的临时结果，避免把两次半程统计相加。
+
+事件 journal 只能更新当前模型步数对应的 checkpoint。例如模型已到 7k、最新权重仍是 5k 时，6k/7k 的验证结果不能写入 5k 的 `events.json`。中断后从 5k 恢复并重算后续更新/验证；对应步的验证 JSON 覆盖，追加日志可能包含重放记录。首次 5k 保存前中断则从头开始。旧 BF16 参数实验、第二轮 FP32+Adam 实验均不能直接恢复到新 FP32+AdamW 配置；配置比较会拒绝混用。新检查点还记录实际 `optimizer_type`，加载时在修改模型权重之前检查类型，避免 Adam 与 AdamW 相似的 state_dict 格式掩盖错误。现有目录本次不移动、不删除，由用户在新训练启动前自行删除，或另指定空 work_dir。
+
+第 15 节修复后，恢复检查同时比较 `renderer` 配置，禁止把旧光栅器梯度积累的训练状态继续作为新版本正式训练。即使清空优化器，旧权重也仍包含旧梯度历史；正式实验应从头开始。旧权重可用于明确标注来源的诊断和前向一致性检查。入口在 `train_rasterizer.json` / `test_rasterizer.json` 记录实际 `.so` 路径、反向版本和编译时源文件 SHA256，并写入启动日志。
 
 ### 6.3 本地日志与飞书
 
@@ -459,10 +469,11 @@ for group, ids in groups.items():
 ~~~text
 work_dir/
   resolved_config.py
-  checkpoints/step-00001000/...
+  checkpoints/step-00005000/...
   latest.json
   final.json
   validation/step-00001000/...
+  diagnostics/step-00001000/update.json
   evaluation/mini/step-00010000/periodic/
   evaluation/mini/step-00100001/final/
   evaluation/total/step-00100001/
@@ -500,7 +511,7 @@ total = trainable + frozen
 
 默认单 GPU、batch=1、eval/no_grad，同步计时；前 5 个 bin 仅不参与耗时统计，仍完整参与质量指标。记录后续每个 bin 的耗时并报告平均值、中位数、P95、计时数量，同时记录 GPU、精度、分辨率、checkpoint。不能只报 UNet 时间、CUDA 异步提交时间或按 18 个目标除出来的单张渲染时间。
 
-实际模型统计为：可训练参数 58,249,264、冻结参数 0、总参数 58,249,264，两档分辨率相同。速度和显存仅做了短程验证，不能作为正式数据集基准；见第 12 节。
+实际模型统计为：可训练参数 58,249,264、冻结参数 0、总参数 58,249,264，两档分辨率相同。已完成的 112×200 FP32+AdamW total 重建平均耗时为 19.287 ms/bin（RTX 4090）；这是当前配置的实测，不能替代 224×400 或其他配置的正式训练/评估记录。第 12 节的显存数字仍仅为早期短测。
 
 ## 9. 调用命令
 
@@ -509,6 +520,9 @@ total = trainable + frozen
 ~~~bash
 conda activate drivingrecon
 
+# 光栅器反向修复后须重新编译；启动时会检查原生二进制版本。
+pip install -e submodules/diff-surfel-rasterization --no-build-isolation
+
 # 两档实验分别训练；重复同一命令时自动恢复本 work_dir。
 CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/112x200.py --mode train
 CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x400.py --mode train
@@ -516,6 +530,12 @@ CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x
 # 正式 total 评估：默认读取相应实验的最终训练 checkpoint。
 CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/112x200.py --mode test --test-split total --checkpoint final
 CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x400.py --mode test --test-split total --checkpoint final
+~~~
+
+当前默认配置与已完成的 AdamW 实验一致。若需固定使用该次训练实际保存的配置，也可用：
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config work_dirs/omniscene/driverecon_static_t1_112x200/resolved_config.py --mode test --test-split total --checkpoint final
 ~~~
 
 `final` 在训练结束保存时明确指向 step=100_001，而不是按 mini 最佳分数自动挑模型。手动评估其他 checkpoint 需显式传路径并在结果中记录步数。两档正式结果分别报告，不以低分辨率训练后只调高测试分辨率替代高分辨率实验。
@@ -534,6 +554,8 @@ CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x
 | scene/PointNet.py、scene/PD_Block.py 及实际调用的注意力模块 | 参数化 V/T，内部特征整除适配，分离预测与监督 |
 | scene/GS_LRM.py | 抽取可复用的重建/渲染逻辑；以兼容原入口的方式支持新适配 |
 | comp_svfgs/trainer.py、checkpoint.py | 精确步数、val/mini/final、完整自动恢复 |
+| comp_svfgs/optimizer.py | 显式构造用户确认保留的 AdamW；仍支持原版 Adam 供历史实验与诊断复现，不静默转换优化器身份 |
+| comp_svfgs/diagnostics.py | 只读记录深度分布、精度、优化器类型、参数更新、权重幅值及归一化缩放参数，不修改网络、损失或样本 |
 | comp_svfgs/evaluation.py、metrics.py | PCC 深度、四指标、双分组和结果持久化 |
 | comp_svfgs/notifications.py | 加载已有 send_feishu，组织通知，网络失败不干扰训练 |
 | .gitignore | 实现时补充 work_dirs、必要数据软链接/运行产物忽略规则；已补充相应忽略规则 |
@@ -548,7 +570,7 @@ CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x
 4. **恢复/节奏验证：** 用极短合成训练模拟 checkpoint 后、验证前、mini 中途、最后一步之后的中断；恢复优化器、采样/RNG 和待办评估事件，最终正好完成规定更新数及最终 mini。
 5. **后续获准运行后的 GPU 检查：** 两档各进行少量前向、反向、保存恢复和评估，确认原生扩展、显存与计时；通过后再正式训练。若 224×400 需要省显存，优先分块渲染并累加同一次更新的视角损失，或采用激活检查点机制；仍是一个 bin 对应一次 optimizer 更新，不静默增加有效 batch、降低分辨率、减少视角或改变损失权重。
 
-以上检查针对代码与协议，不是对 OmniScene 做质量审查。已完成的短程验证见第 12 节；没有全量数据扫描、坏样本过滤或正式训练。
+以上检查针对代码与协议，不是对 OmniScene 做质量审查。初次实现的短程验证见第 12 节，两次后续修复分别见第 13、14 节。
 
 ## 11. 本次核对的代码依据
 
@@ -564,6 +586,8 @@ CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x
 
 ## 12. 实现与验证记录（2026-09-26）
 
+本节是首轮正式训练之前的历史记录，BF16 权重、依赖状态及 CUDA 显存数字仅描述当时的版本，不代表本次 FP32 参数版本已经完成 GPU 验证。
+
 ### 12.1 已实现内容与具体做法
 
 - 两档配置、静态六相机数据/模型接口、原生 2D Gaussian 渲染、Metric3D 分类/L2 和分割监督、SVF-GS 风格的新视角 RGB 掩码均已接入。
@@ -574,7 +598,7 @@ CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x
 - 静态分支的注意力使用 PyTorch SDPA，保持原权重和注意力计算定义，避免无 xFormers 时显式构造巨大的注意力矩阵；旧分支默认行为保留。
 - 18 路 RGB loss 采用“逐视角累计高斯参数梯度，再对网络反传一次”的等价实现，避免同时保留 18 份光栅器反向缓冲。仍是一个 bin、一次 optimizer 更新、18 路 L1 求和，已经与直接求和反传做梯度一致性测试。
 - PCC 专用渲染输出累计中心 z，未经过 RGB clamp、alpha 归一化或 surfel 交点深度替换。输出包括两组指标、逐 bin CSV、汇总 JSON、参数量、精度与重建耗时。
-- 原代码的网络参数本身就是 BF16，因此最终配置显式固定为 `model.parameter_dtype='bfloat16'`。没有仅开启 autocast 而无意改成 FP32 主参数训练；深度采样点仍保留 FP32。
+- 初次实现沿用原代码的 BF16 参数，使用 `model.parameter_dtype='bfloat16'`；本次已按第 13 节修订为 FP32 参数，保留 BF16 autocast。
 
 ### 12.2 已完成验证
 
@@ -607,3 +631,225 @@ work_dirs/verification_cli_final_20260926/run/
 - VGG16 权重默认读取 `~/.cache/torch/hub/checkpoints/vgg16-397923af.pth`，也可设置 `evaluation.lpips_vgg_weights`。当前机器已有该文件。训练和评估不会触发权重下载；其他机器需要在启动前显式准备，README 给出了准备命令。
 - 原 Waymo 的 `train.py --help` 在当前环境被缺少的 `simple_knn` 阻断，因此没有宣称旧入口完成了运行回归。共享网络的原默认配置和权重结构已保留；新 OmniScene 路径不依赖该模块，原生 surfel CUDA 渲染已实际验证。
 - .gitattributes 只让 Git 的空白检查正确识别原 source/README 的 CRLF，不更改运行逻辑；验证产生的原仓库已跟踪 pyc 已恢复，未留下二进制缓存变更。
+
+## 13. 首轮退化后的最小修复（2026-09-26）
+
+本节记录第一次修复的决定与验证。第 14 节曾尝试 AdamW；当前默认选择及必要例外以第 16 节审查后的用户决定为准。
+
+### 13.1 依据与边界
+
+首轮 112×200 完成 100,001 步及最终 2,048-bin mini：all_18 PSNR 约 17.9994、PCC 约 -0.2205。该结果仅为 mini；现有训练产物全部保留，本次不重算指标、不改写检查点。
+
+CPU 诊断中，三个验证样本的几何辅助深度全部饱和至 255 米，主深度分类 argmax 集中于同一类别；主深度采用概率期望加残差，因此不能称为严格常数图。几何辅助验证损失从 8k 至 100k 连续 93 次完全相同。参数和全部 Adam 动量均为 BF16，简单 CPU 算术也证明该精度下小更新和 `0.999` 衰减可能被舍入吞掉；这支持精度修复，但尚未证明它是退化的唯一原因。
+
+本次只把两档实验的参数、梯度累积及 Adam 动量改为 FP32，保留 BF16 autocast。优化器仍为 Adam，lr=4e-4、weight_decay=0.05、betas/eps、所有损失及权重、深度分类/激活、静态六相机协议均保持原定义。精度改变不会增加模型参数个数，但会增加参数与优化器状态的存储量；新版本的实际显存和速度须以后重新测量。
+
+原 `PD_Block.py` 中 `ones_like` 后再 scatter 1 使 `split_mask` 恒为零，作者公开代码同样如此。论文描述阈值分流，无法直接推导一个确定的替代实现；本次不改为 zeros、不自行选择阈值。论文的 AdamW 和损失配方与公开代码也有差异，本次继续以已确认的代码配置为准，不拼接不同配方、不搜索更高分数的设置。
+
+参考：[PyTorch 2.3 autocast 使用指导](https://docs.pytorch.org/docs/2.3/amp.html)、[作者 PD-Block 源码](https://github.com/EnVision-Research/DriveRecon/blob/main/scene/PD_Block.py)、[论文 §3.2、§4.2](https://proceedings.neurips.cc/paper_files/paper/2025/file/f5717c76feff4f751604c0678c46627b-Paper-Conference.pdf)。已有 CPU 诊断位于忽略目录 `work_dirs/diagnostics/depth_cpu_20260926/` 和 `work_dirs/diagnostics/reproduction_audit_20260926/`。
+
+### 13.2 训练状态诊断
+
+- `diagnostics.enabled=True`；第 1 步、每次验证对应的训练更新步、最终更新步记录 `diagnostics/step-XXXXXXXX/update.json` 和 `metrics.jsonl` 的 `health` 记录。
+- 记录全部模型参数、已有梯度及 Adam 一阶/二阶动量的 dtype；对输入卷积、深度分类头、深度残差头记录该次更新的参数变化比例、最大变化、梯度范数和非有限梯度数量。只克隆这些小模块的更新前参数，不保留额外完整模型副本。
+- 每次验证的 `summary.json` 增加 `diagnostics`，保留每个 bin 的主深度均值、逐相机空间标准差、非有限值比例、分类 argmax 占比与类别数，以及每个几何辅助深度的均值、空间标准差和 0/255 边界饱和比例；汇总为逐 bin 等权平均，不能把类别数等均值当作整个验证集的唯一类别数。
+- 诊断不参与损失、不修改梯度、不消耗随机数、不筛除/替换样本，不以某个 PSNR/PCC 阈值自动调整配置或中断训练。非有限统计如实记录。
+
+### 13.3 下次运行的检查点与本次验证范围
+
+本次仅代码开发和 CPU 合成测试，不调用 GPU、不启动正式训练，也不删除已有结果。下次训练前由用户删除旧实验目录，或使用另一个空目录；不把旧 BF16 权重或 Adam 状态作为恢复来源。新配置仍拒绝与旧模型配置混用。
+
+后续先运行 112×200，固定 seed=0 和 100,001 步计划；在 10k 的第一次 mini 后结合诊断日志人工检查，确认参数实际更新、深度不再整体饱和并存在有效学习，再继续同一轮。10k 是检查时点，不是新增的自动提前停止器。若同样退化再次出现，应定位首个异常环节或获取作者实现依据，不自动尝试其他学习率、权重、种子或额外训练轮次。112×200 的正常性确认后再安排 224×400。
+
+本次 CPU 验证已完成：`tests.test_omniscene` 和 `tests.test_omniscene_repair` 共 21 项通过。验证时设置 `CUDA_VISIBLE_DEVICES=''`，屏蔽 CUDA 可用性检查，并将 CUDA 初始化/同步/设备查询替换为报错函数；未运行 GPU smoke 或真实训练入口。
+
+新增回归覆盖两档 FP32 参数/BF16 autocast 配置、实际 CPU autocast 下 Adam 动量精度、诊断不改变梯度/随机状态、5k 保存与 1k 验证独立（以 1:5:10 的小步数合成流程验证）、首次保存前及保存间隔中断后的事件回放、mini/final 中断恢复、旧精度检查点拒绝混用。CPU 通过不代表新精度版本已经在 GPU 上验证或收敛；原生 GPU 扩展和正式训练本次未运行。
+
+## 14. 第二轮退化：权重衰减语义修复（2026-09-27）
+
+> 历史排障记录。第 16 节补充了修正光栅器后恢复 Adam 的诊断和用户保留 AdamW 的决定；论文使用 AdamW 本身不能证明公开代码的 Adam 写错。
+
+
+### 14.1 现象与 CPU 定位
+
+第二轮采用 FP32 参数/动量、BF16 autocast，但仍沿用公开代码的 Adam。相同 2,048-bin mini 的 all_18 PSNR 从 10k 的 20.924 降至 30k 的 19.859，PCC 从 0.740 降至 0.687。13k 辅助几何深度在全部 10 个验证 bin 上成为常量，14k 主深度分类单一类别占比达到 99.94%，之后反复恢复和失稳。用户已在约 37k 停止训练。
+
+CPU 读取 5k、10k、15k、20k、30k、35k 的现有检查点，发现多处深层卷积与归一化缩放参数被压至极小值。例如 35k：
+
+| 参数 | 平均绝对值 |
+| --- | ---: |
+| unet.down_blocks.3.nets.0.norm1.weight | 1.85e-35 |
+| unet.mid_block.nets.0.norm2.weight | 3.20e-14 |
+| adapter.depth_regression_head.2.weight | 3.55e-12 |
+
+使用已保存的同一个六相机样本，只在 CPU 执行编码器至辅助深度输入的部分前向：5k 的几何深度空间标准差约 6.27 米；35k 使用 FP32 算术也只剩约 1.07e-5 米，使用 CPU BF16 autocast 则为 0。这表明输入相关信号在权重/特征层面已经很弱，单纯把退化检查点的前向切为 FP32 无法恢复学习到的几何；不能把此次常量图仅解释为 BF16 tanh 的 255 米饱和。CPU 前向不等于原生 GPU 渲染或正式指标评估。
+
+### 14.2 可复查的机制及修复依据
+
+当前 PyTorch 2.3 的 Adam 把 `weight_decay * parameter` 加进任务梯度后计算自适应动量；AdamW 则独立执行 `parameter *= 1 - lr * weight_decay`。相同的 `weight_decay=0.05` 并不表示相同的衰减行为。
+
+保持 lr=4e-4、weight_decay=0.05、betas=(0.9,0.999)、eps=1e-15，用 FP32 标量和显式零任务梯度做 CPU 对照，10,000 次更新后：
+
+| 初始参数 | Adam | AdamW |
+| --- | ---: | ---: |
+| 1.0 | 约 -3.18e-40 | 0.818507 |
+| 0.02 | 约 2.16e-41 | 0.016370 |
+
+这证明耦合 L2 在弱任务梯度分支上足以造成观察到的强收缩机制；与检查点中的权重和特征消失一致，但没有证明它是本项目退化的唯一原因。不能把零任务梯度对照当作真实训练重现实验。
+
+[论文 §4.2](https://proceedings.neurips.cc/paper_files/paper/2025/file/f5717c76feff4f751604c0678c46627b-Paper-Conference.pdf) 明确指定 AdamW、lr=4e-4、weight_decay=0.05；公开 `scene/GS_LRM.py` 实际使用 Adam。此前仅记录这种不一致，本次在权重收缩证据和 CPU 对照基础上，明确改用论文给出的优化器身份，属于有依据的复现修复尝试，不进行超参数搜索，也不声称已经恢复作者完整训练配方。
+
+原始证据与 CPU 脚本位于 `work_dirs/diagnostics/second_repair_20260926/{audit_decay.py,audit.json,audit.log}`（脚本开始于 9 月 26 日，未修改任何已有检查点）。
+
+### 14.3 实现范围
+
+1. 两档配置显式设置 `optimizer.type='AdamW'`，训练入口和 GPU smoke 脚本共用 `build_optimizer`。只开发 smoke 入口，本次不执行它。旧配置缺少 type 时仍按原 Adam 解释，避免篡改历史配置语义。
+2. UNet/adapter 两组的 lr、weight_decay、betas、eps 全部保持原数值，归一化参数和 bias 仍留在原参数组内，不额外增加免衰减分组。保持 FP32 参数/动量与 BF16 autocast。
+3. 模型结构、深度分类/残差/tanh、损失和权重、seed=0、静态六相机协议均不改；PD-Block 的全 1 掩码仍按公开代码保留，未猜测阈值或重设计分流。
+4. 每 1k 验证、每 5k 保存、每 10 次验证 mini、100,001 步及最终 mini 均保持。旧训练记录保留，用户清理后从头启动；不把已压零的权重和 Adam 状态转为 AdamW 接着训。
+5. 启动日志/飞书、诊断及新检查点记录实际优化器类型；恢复同时核对配置和新检查点的类型元数据。同一 AdamW 实验仍可自动续训。
+6. 在已有更新诊断中增加参数平均绝对值/最大值、非零梯度元素数/最大梯度；增加深层 GroupNorm、几何融合 BatchNorm 的监测，并单独记录归一化的 `weight`，避免非零 bias 掩盖 scale 压零。仍只读记录，不改变损失、梯度或随机状态，不按分数自动停训或审查样本。
+
+### 14.4 验证与下一轮判读
+
+本次只运行 CPU 合成测试、现有检查点统计及有界部分前向；不运行真实训练、GPU 前向、CUDA 光栅器或全量评估。`tests.test_omniscene` 与 `tests.test_omniscene_repair` 共 **26 项通过**；使用 `CUDA_VISIBLE_DEVICES=''`，CUDA 可用性返回 False，CUDA 初始化/同步/设备查询替换为报错函数。训练入口与 GPU smoke 文件仅作语法检查，未执行。
+
+新增测试确认：UNet/adapter 两组在零任务梯度下按固定系数乘法衰减，衰减不进入自适应动量；CPU autocast 下参数/梯度/动量均保持 FP32；非零 bias 不掩盖归一化 scale 压零；诊断不改变优化更新与随机状态；旧 Adam 配置及新检查点的类型元数据均能阻止错误恢复；AdamW 的参数、动量及训练/验证/mini 事件在恢复后与连续运行一致。`git diff --check` 通过。既有训练结果与用户暂存区均未清理或覆盖。
+
+下一轮不仅检查参数是否发生变化，还要结合归一化缩放参数幅值、辅助深度空间标准差、分类集中程度和损失趋势，重点覆盖前两轮出现异常的 10k–20k 区间。本次修复消除了已定位的优化器语义差异，正常收敛仍需用户之后的训练验证；若再次退化，不自动进入调学习率/损失/种子的循环。
+
+## 15. 第三轮退化：原生光栅器反向修复（2026-09-27）
+
+### 15.1 已确认的现象与证据边界
+
+第三轮工作目录为 `work_dirs/omniscene/driverecon_static_t1_112x200_adamw`，用户停止于 28,054 步。两次 mini 均完整评估 2,048 个 bin，均非 total 正式结果：
+
+| 步数 | 视角组 | PSNR | SSIM | LPIPS | PCC |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 10k | all_18 | 20.743747 | 0.566147 | 0.541053 | 0.719483 |
+| 20k | all_18 | 15.218267 | 0.253531 | 0.666288 | 0.352688 |
+| 10k | novel_12 | 19.581767 | 0.527088 | 0.556369 | 0.712153 |
+| 20k | novel_12 | 14.841846 | 0.223764 | 0.673601 | 0.342825 |
+
+逐步训练日志把首次明显异常缩小至 13,100–13,200 步。验证损失从 13k 的 5.175 升至 14k 的 9.044；14k 辅助深度约 99.83% 为零，18k 的 10 个验证 bin 中有 9 个完全为零。这些是预测值统计，与辅助监督的有效像素集合为空是两回事。
+
+CPU 对 5k/10k/15k/25k 检查点做有界部分前向：一个缓存样本的辅助深度输入在 10k 约为 −1.15～0.05，在 15k 已为 −220～−22；纯 FP32 仍饱和。此时深层归一化缩放参数仍约 0.74，不是第 14 节的参数压零现象。仅把 tanh 改为等价 sigmoid 或切换整个前向为 FP32，缺乏挽救上游特征失稳的证据。
+
+用户授权后，从原 10k 完整状态在独立目录用原二进制重放 4,000 次更新，未改配方、数据顺序或优化器，不发送通知、不覆盖原目录。该重放到 14k 时验证损失为 5.273，**未重现原 14k 的坍缩**。因此不能声称已经找到该次突变的唯一触发因素，也不能将此次重放视作确定性重现或修复后的收敛结果。
+
+### 15.2 确定的实现错误
+
+`submodules/diff-surfel-rasterization/cuda_rasterizer/forward.cu::compute_aabb` 计算投影中心时使用 cutoff=3，即 `q=(9,9,-1)`。其函数定义为：
+
+~~~text
+d = sum(q * Tw²)
+px = sum(q * Tu * Tw) / d
+py = sum(q * Tv * Tw) / d
+~~~
+
+原 `backward.cu::compute_transmat_aabb` 却按 cutoff=1 计算导数，并遗漏分母求导产生的交叉项。因此对低通滤波中心回传的梯度不是上述前向函数的导数，可把位置、尺度和旋转向错误方向更新。
+
+双精度反例：`Tu=(2,3,4), Tw=(0.2,0.3,2)`。`dpx/dTw` 的正确值为 `(−8.023574, −12.035361, 3.261372)`；旧实现为 `(−0.527479, −0.811249, −1.103032)`，第三项甚至反号。这是实现错误，不是根据验证集指标选择更有利的训练参数。
+
+对输出余切 `(gx,gy)`，修复后的 VJP 为：
+
+~~~text
+gTu = gx * q * Tw / d
+gTv = gy * q * Tw / d
+gTw = q / d * [gx * (Tu − 2*px*Tw) + gy * (Tv − 2*py*Tw)]
+~~~
+
+该增量累加到已有变换矩阵梯度，保留射线交点和其他损失路径的梯度。`aabb_math.h` 由实际 CUDA kernel 调用，也供 CPU 编译测试直接调用。前向只将原常数 3 命名为共享 `AABB_CUTOFF`；没有改变数值公式。当前 `TIGHTBBOX=0`；若未来启用随 opacity 变化的边界，编译检查要求先实现对应导数，避免静默套用固定 cutoff 的反向。
+
+### 15.3 修复范围与运行要求
+
+- 只修正上述原生反向；不改网络结构、tanh、PD 分流/分区、类别映射、数据、损失及权重、AdamW、lr、wd、eps、seed 或混合精度。
+- 保持每 1k 验证、5k 保存、10 次验证 mini、100,001 次更新及最终 mini。
+- 原生扩展发布 `aabb_backward_version=1` 和编译时源文件 SHA256；两档配置要求版本 1。未重编译时给出明确编译指令，不允许悄悄继续使用旧反向。
+- 旧权重和优化器仅作诊断来源，新正式实验使用空 work_dir 从头训练；已有记录由用户决定何时清理。
+- 原生前向在分母接近零时仍可能产生大导数。此次不新增 epsilon、截断或裁剪；真实导数修正不等于消除所有数值奇异性。
+
+### 15.4 验证与产物
+
+诊断产物位于 `work_dirs/diagnostics/third_repair_20260927/`。`audit.py/audit.json` 保存 CPU 特征及激活梯度统计；`replay.py`、`replay_gpu/trace.jsonl` 和 `complete.json` 保存旧二进制 10k→14k 的隔离重放。该目录的权重、日志和测速均不是正式训练/评估结果。
+
+`tests/test_rasterizer_gradients.py` 编译 CUDA 实际使用的同一 C++ helper，对照 double 自动微分与中心有限差分，并检查梯度累加、旧二进制拒绝使用和旧 renderer 状态拒绝恢复。与既有回归合计 30 项 CPU 测试通过。
+
+`tests/verify_rasterizer_cuda.py` 对真实 CUDA 低通支路做有限差分，覆盖预计算变换矩阵以及 means/scales/rotation 路径；同时比较同一固定检查点的高斯输出和渲染。脚本不做优化更新，先检查 GPU 显存占用低于 1 GB，旧/新结果分别记录到 `native_before.json` / `native_after.json`。
+
+实际验证已完成：
+
+| 检查 | 结果 |
+| --- | --- |
+| 原生预计算变换矩阵 VJP | 最大绝对差由旧版 0.266147 降为 0.000193；修复后通过 float32 有限差分检查 |
+| 原生 means/scales/rotation 链式梯度 | 旧版最大绝对差约 0.166；使用足够区分 float32 舍入的扰动后，新版最大绝对差 0.000291，检查通过 |
+| 低通分支覆盖 | 样例的 rho2d=3.887 < rho3d=84.334，像素值及中心梯度非零，不是绕过错误分支的空测试 |
+| 前向保持 | 微型渲染以及同一 10k 检查点、缓存 bin 的全部高斯参数和一张渲染图，与旧二进制逐值相同（rtol=atol=0） |
+| 原生构建 | 本机 drivingrecon 的 editable 扩展已重新编译；实际版本 1，源文件 SHA256 为 `4ac0ee0af315415e1a361528742dbcf7373a28786ccae975368f92c91be4700f` |
+| 两档功能检查 | 112×200、224×400 各用一个训练 bin 做 2 次优化更新、验证、完整状态保存恢复及一个 mini bin 的四指标检查，均通过 |
+
+两档功能检查调用 `tests/smoke_omniscene_cuda.py`，报告保存在 `smoke/verification.json`。其临时权重在 `/tmp` 中验证后自动移除，只保留诊断报告，不改变正式的每 5k 保存配置，也不向飞书发送消息。该检查证明新二进制可用于当前训练链路；两次更新和单 bin 分数不证明长期收敛或正式性能。
+
+### 15.5 两轮交叉复核结论
+
+使用本地 expert-review 技能，由数值实现、复现协议、稳定性三位专家分别独立审查，再结合作者回应进行第二轮交叉审阅。三方同意只修复已证实的原生 VJP，不把 PD 掩码全一、异或 fold、批量大于一的几何排列等其他原代码缺陷一并改写；当前没有证据证明这些缺陷触发了本轮突变。
+
+作者接受全部核查意见：原/新辅助 loss 的单位与梯度一致，18 视角分块链式回传及 K/位姿测试通过；不将辅助预测零误作监督空集合，不将 tanh 饱和或 surrogate 标量作为已证明根因。保留意见是：局部导数修复必须通过实际 CUDA 分支验证，旧优化器历史应隔离，分母近零风险仍存在，最终收敛仍待新的正式训练观察。没有专家认为目前可以保证恢复论文指标。
+
+## 16. 发布代码一致性审查与最终保留项（2026-09-28）
+
+### 16.1 结论与用户决定
+
+用户要求对比实验尽可能遵循公开代码，不以论文的不同写法作为改变优化器或调度器的理由。本次逐项比较暂存区、`main` 的 `scene/GS_LRM.py::training_setup` 和 `train.py` 的实际执行路径。
+
+**保留已经验证的原生反向修复；另保留用户确认的 FP32 参数/动量、AdamW 两项稳定性例外。默认配置与刚完成的完整实验一致。** 这不是论文与公开代码的完全同配置复现，应明确披露这两项例外及静态数据适配。既有网络架构、监督、损失项和权重不变，不继续搜索学习率、衰减、种子或替换模块。
+
+光栅器投影中心 VJP 是通过有限差分确认的实现错误。修复后 FP32+AdamW 完成 100,001 步且 total 指标正常，支持修复有效，但不能推出“它是唯一原因，因此其他改动都可无影响地回退”。本次单独恢复 Adam 的诊断在 4k 又出现辅助几何深度接近常值，证实优化器差异不能排除。第 14 节的零任务梯度对照仅证明衰减语义差异；保留 AdamW 的最终依据是实际退化证据和用户决定，而不是仅因为论文使用 AdamW。
+
+### 16.2 逐项审查
+
+| 项目 | 作者实际运行的代码 | 最终处理及影响 |
+| --- | --- | --- |
+| 原生反向 | cutoff 与前向不一致，商式求导缺少交叉项 | 保留正确 VJP、共享常数、数值测试及二进制版本检查；这是改变错误梯度的实现修复，前向不变 |
+| 优化器 | `torch.optim.Adam`，耦合 L2 | 保留 AdamW 稳定性例外；该改动确实影响衰减与训练轨迹，不能说成无影响整理 |
+| 学习率 | 两参数组显式 0.0004，覆盖构造函数全局默认 0.001 | 始终保持有效值 0.0004 |
+| 学习率调度 | 只创建 `lrm_scheduler_args`，训练循环未调用 | 始终恒定；没有从原版调度改成论文调度，也不添加 warmup/余弦衰减 |
+| weight_decay / betas / eps | 两组 .05；默认 (.9,.999)；1e-15 | 数值全部保持；归一化和 bias 仍在原参数组内，不额外创建免衰减组 |
+| 参数、梯度、动量存储 | BF16 | 保留用户确认的 FP32 数值例外，防止小更新被舍入；该差异也会影响更新、存储量和训练轨迹 |
+| 前向混合精度 | BF16 | 保持 BF16 autocast，必要几何/光栅接口使用 FP32 |
+| 模型、激活与损失 | 已有公开模块与损失配方 | 暂存的退化修复未重设计网络或损失；不改 tanh、PD 掩码、fold、深度范围或损失权重 |
+| 保存与验证 | 原 Waymo 循环 | 按用户指定协议保留 1k 验证、5k 保存、10k mini、最终 mini；保存间隔影响中断后重放量，不改变连续训练的更新 |
+| 日志与恢复保护 | 无对应 OmniScene 实现 | 保留只读诊断、事件恢复、优化器/二进制身份保护；CPU 测试确认诊断不改变更新和随机状态 |
+
+静态 T=1、六相机、两档实际输入分辨率、Metric3D 米制监督、正确的深度类别映射、动态掩码、一个 bin 一次更新、18/12 路评估均为用户确认的实验适配要求。不能为“回归原版”恢复额外时序/LiDAR 输入、两倍输入放大或原 Waymo 的同一 batch 连续更新 500 次。
+
+### 16.3 回退诊断的实际证据
+
+GPU 启动前显存占用约 265 MiB，满足用户低于 1 GB 才调试的条件。全部诊断使用已修正反向的原生扩展、独立目录、相同种子与样本顺序，从头初始化；不加载已完成权重、不修改正式记录、不发送通知。
+
+**BF16 与 FP32 存储对照：** 各运行 1,000 步。BF16 下，三层被监测归一化 scale 有非零任务梯度，却始终全部等于初始化值 1；FP32 下权重能够更新。这个舍入问题在修正光栅器后仍存在，支持保留 FP32 例外。不能把 FP32 对更新的改善误写为单独保证收敛。
+
+**恢复 Adam 的较长诊断：** FP32 存储、BF16 前向、正确 VJP，其余配置不变；验证结果如下：
+
+| 更新步数 | 主深度空间标准差（米） | 主深度最大类别占比 | 辅助深度空间标准差（米） |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 38.9811 | 26.57% | 27.0940 |
+| 2,000 | 22.8809 | 47.76% | 13.3075 |
+| 3,000 | 23.0637 | 66.55% | 5.2905 |
+| 4,000 | 29.4787 | 28.69% | 0.006809 |
+
+4k 辅助深度均值约 124.64 米，全部 10 个验证 bin 的空间标准差相同，接近常值；三层被监测 GroupNorm 的 scale 均值约 0.0386。此时主深度仍有空间变化，因此不能声称主深度/PCC 已经全面崩溃，但已不满足避免辅助深度退化的要求。用户据此明确选择保留已完成稳定实验的 AdamW，作为另一个有证据的稳定性例外。
+
+这次计划最多 14k 的诊断在 4,090 步收到 SIGTERM（退出码 143），无 Python 异常记录，发送者和原因未知；不能记作完成 14k，也不能记作 CUDA 错误。未启动新的完整正式训练。证据保存在 `work_dirs/diagnostics/release_recipe_20260928/`：`adam_bf16_1000/`、`adam_fp32_1000/`、`adam_fp32_14000/`（最后一个目录名表示计划上限，实际步数见 `status.json`）。
+
+### 16.4 结果归属与代码验证
+
+已完成的实验仍是 `FP32 + AdamW + corrected AABB backward`，目录 `work_dirs/omniscene/driverecon_static_t1_112x200` 原样保留，默认配置保持兼容：
+
+- checkpoint：`step-00100001`；total：30,080 个 bin，两组均无缺失/重复，四指标均有限。
+- all_18：PSNR 23.605495，SSIM 0.732151，LPIPS 0.291745，PCC 0.781584。
+- novel_12：PSNR 21.378014，SSIM 0.652182，LPIPS 0.343138，PCC 0.770527。
+
+不能将这些结果改标为原版 Adam 的成绩。若将来另行比较 Adam，须使用不同工作目录并从头训练，不能转换 AdamW 动量继续训练后声称原版复现。
+
+CPU 验证共 32 项：新增测试直接抽取公开 `Gaussian_LRM.training_setup`，给参考 Adam 与工厂 Adam 相同 FP32 参数和梯度，连续更新后参数及动量逐值一致，排除诊断用的 Adam 工厂另有语义错误；保留光栅器 VJP、诊断无副作用、5k 保存和断点恢复测试；Adam/AdamW 两类均覆盖完整状态重载，拒绝把旧 AdamW 权重错误标为 Adam 配置。正式结果目录没有被诊断覆盖，原暂存区保持不变，本次审查改动留在工作区供审阅。

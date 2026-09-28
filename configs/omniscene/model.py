@@ -1,5 +1,7 @@
 model = dict(
-    parameter_dtype='bfloat16',  # Original Gaussian_LRM casts both networks to BF16.
+    # Explicit numerical exception to the release's BF16 parameter storage.
+    # Keep small optimizer updates in FP32; forward still uses BF16 autocast.
+    parameter_dtype='float32',
     view_num=6, num_frames=1, num_samples=200,
     depth_min=0.1, depth_max=400.0,
     gaussian_scale_min=0.001, gaussian_scale_max=4.0,
@@ -13,6 +15,7 @@ model = dict(
         layers_per_block=1, skip_scale=0.5 ** 0.5,
     ),
 )
-renderer = dict(znear=0.01, zfar=1e8, background=(0.0, 0.0, 0.0))
+renderer = dict(znear=0.01, zfar=1e8, background=(0.0, 0.0, 0.0),
+                aabb_backward_version=1)
 loss = dict(rgb=1.0, segmentation=1.0, depth_class=2.0,
             depth_reg=2.0, geometry_aux=2.0)

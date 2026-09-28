@@ -35,6 +35,8 @@ def load_config(argv=None):
         raise ValueError('Train/validation/test batch_size must be 1')
     if cfg.precision not in ('bf16', 'no'):
         raise ValueError('Supported precision: bf16 or no')
+    if cfg.optimizer.get('type', 'Adam') not in ('Adam', 'AdamW'):
+        raise ValueError('Supported optimizer types: Adam, AdamW')
     for key in ('max_steps', 'validate_every_steps', 'mini_every_n_validations', 'checkpoint_every_steps', 'log_every_steps'):
         if cfg.training[key] < 1:
             raise ValueError('training.' + key + ' must be positive')
@@ -56,8 +58,9 @@ def main(argv=None):
     from comp_svfgs.metrics import ImageMetrics
     from comp_svfgs.model import StaticDriveRecon
     from comp_svfgs.notifications import Notifier
+    from comp_svfgs.optimizer import build_optimizer
     from comp_svfgs.renderer import SurfelRenderer
-    from comp_svfgs.runtime import preserve_rng
+    from comp_svfgs.runtime import preserve_rng, atomic_json
     from comp_svfgs.sampler import ResumableBatchSampler
     from comp_svfgs.trainer import Trainer
 
@@ -77,6 +80,10 @@ def main(argv=None):
     logging.info('Configuration:\n%s', cfg.pretty_text)
     model = StaticDriveRecon(cfg.model)
     renderer = SurfelRenderer(cfg.renderer)
+    renderer.validate_backend()
+    native_info = renderer.backend_info()
+    atomic_json(work_dir / (cfg.mode + '_rasterizer.json'), native_info)
+    logging.info('Rasterizer: %s', native_info)
     options = dict(num_workers=cfg.data_loader.num_workers, pin_memory=cfg.data_loader.pin_memory)
 
     def eval_loader(split):
@@ -99,8 +106,7 @@ def main(argv=None):
         logging.info('Evaluation complete: %s', summary)
         return
 
-    optimizer = torch.optim.Adam(model.optimizer_groups(cfg.optimizer), lr=cfg.optimizer.lr,
-                                  betas=tuple(cfg.optimizer.betas), eps=cfg.optimizer.eps)
+    optimizer = build_optimizer(model.optimizer_groups(cfg.optimizer), cfg.optimizer)
     model, optimizer = accelerator.prepare(model, optimizer)
     train_data = OmniSceneDataset(cfg.dataset, cfg.image_shape, 'train')
     sampler = ResumableBatchSampler(len(train_data), cfg.seed)

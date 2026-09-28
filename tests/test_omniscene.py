@@ -95,8 +95,8 @@ class GeometryAndModelTests(unittest.TestCase):
     def test_static_native_network_shape_and_no_label_dependency(self):
         from mmcv import Config
         cfg = Config.fromfile('configs/omniscene/112x200.py')
-        cfg.model.parameter_dtype = 'float32'  # CPU structural test; CUDA smoke uses the BF16 experiment unchanged.
         model = StaticDriveRecon(cfg.model).eval()
+        self.assertTrue(all(p.dtype == torch.float32 for p in model.parameters()))
         for h, w in [(24, 40), (32, 56)]:
             context = dict(image=torch.rand(1, 6, 3, h, w),
                            intrinsics_pixel=torch.tensor([[30., 0., 10.], [0., 30., 10.], [0., 0., 1.]]).repeat(1, 6, 1, 1),

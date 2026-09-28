@@ -19,6 +19,7 @@
 #define NUM_WARPS (BLOCK_SIZE/32)
 
 #define TIGHTBBOX 0
+#define AABB_CUTOFF 3.0f
 #define RENDER_AXUTILITY 1
 #define DEPTH_OFFSET 0
 #define ALPHA_OFFSET 1

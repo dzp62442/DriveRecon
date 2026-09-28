@@ -1,6 +1,8 @@
 """Shared mini/total evaluator with full reconstruction timing and two view groups."""
 
 import csv
+from datetime import timedelta
+import logging
 from pathlib import Path
 from time import perf_counter
 
@@ -43,7 +45,9 @@ class Evaluator:
         records, times, timing_rows = [], [], []
         fields = ['bin_token', 'group', 'psnr', 'ssim', 'lpips', 'pcc']
         atomic_json(out / 'evaluation_summary.json', dict(metadata, processed_bins=0))
+        total_bins = len(loader)  # The evaluation protocol uses batch_size=1.
         start = perf_counter()
+        logging.info('Evaluation [%s] started: step=%d, bins=%d', split, step, total_bins)
         was_training = self.model.training
         with preserve_rng(), (out / 'per_bin_metrics.csv').open('w', newline='') as stream:
             self.model.eval()
@@ -80,6 +84,15 @@ class Evaluator:
                     if (index + 1) % 25 == 0:
                         atomic_json(out / 'evaluation_summary.json', dict(metadata, processed_bins=index+1,
                                                                            groups=summarize_records(records)))
+                    processed = index + 1
+                    if processed % 100 == 0 or processed == total_bins:
+                        elapsed = perf_counter() - start
+                        remaining = elapsed / processed * max(total_bins - processed, 0)
+                        logging.info(
+                            'Evaluation [%s] %d/%d bins (%.1f%%), elapsed=%s, ETA=%s, speed=%.2f bins/s',
+                            split, processed, total_bins, 100. * processed / total_bins,
+                            timedelta(seconds=int(elapsed)), timedelta(seconds=int(remaining)),
+                            processed / max(elapsed, 1e-9))
                 metadata['complete'] = True
             finally:
                 self.model.train(was_training)
@@ -89,4 +102,6 @@ class Evaluator:
                                evaluation_seconds=perf_counter()-start)
                 atomic_json(out / 'reconstruction_timing.json', dict(summary=timing, per_bin=timing_rows))
                 atomic_json(out / 'evaluation_summary.json', summary)
+        logging.info('Evaluation [%s] complete: %d bins in %s', split, len(times),
+                     timedelta(seconds=int(summary['evaluation_seconds'])))
         return summary

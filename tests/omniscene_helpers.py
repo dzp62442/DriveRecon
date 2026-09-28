@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from comp_svfgs.dataset_omniscene import CAMERAS
 from comp_svfgs.omniscene_io import asset_path
 from comp_svfgs.sampler import ResumableBatchSampler
+from comp_svfgs.optimizer import build_optimizer
 from comp_svfgs.trainer import Trainer
 
 
@@ -109,17 +110,20 @@ def toy_config(root):
                 renderer=dict(znear=.01, zfar=1e8, background=(0., 0., 0.)),
                 model=dict(depth_min=.1, depth_max=400., num_samples=3),
                 loss=dict(rgb=1., segmentation=1., depth_class=2., depth_reg=2., geometry_aux=2.),
-                optimizer=dict(lr=.001), evaluation=dict(time_skip_bins=1, save_images=False),
+                optimizer=dict(type='AdamW', lr=.001, weight_decay=.05, betas=(.9, .999), eps=1e-15),
+                evaluation=dict(time_skip_bins=1, save_images=False),
                 training=dict(max_steps=5, validate_every_steps=2, mini_every_n_validations=2,
                               checkpoint_every_steps=2, log_every_steps=1, resume='auto'))
 
 
-def make_trainer(root, trainer_type=Trainer, evaluator=None):
+def make_trainer(root, trainer_type=Trainer, evaluator=None, optimizer_type='AdamW'):
     torch.manual_seed(11)
     model = ToyModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=.001)
+    cfg = toy_config(root)
+    cfg['optimizer']['type'] = optimizer_type
+    optimizer = build_optimizer(model.parameters(), cfg['optimizer'])
     sampler = ResumableBatchSampler(7, 37)
     loader = DataLoader(ToyDataset(), batch_sampler=sampler, generator=sampler.loader_generator)
     evaluation_loader = DataLoader(ToyDataset(), batch_size=1, generator=torch.Generator().manual_seed(90))
-    return trainer_type(toy_config(root), model, optimizer, sampler, loader, evaluation_loader, evaluation_loader,
+    return trainer_type(cfg, model, optimizer, sampler, loader, evaluation_loader, evaluation_loader,
                         ToyRenderer(), evaluator, CPUAccelerator(), lambda *_: None)

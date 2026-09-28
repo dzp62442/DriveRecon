@@ -8,6 +8,7 @@ import uuid
 import torch
 
 from .runtime import atomic_json, rng_state, restore_rng
+from .optimizer import optimizer_name
 
 
 def complete_checkpoint(path):
@@ -44,6 +45,7 @@ def save_checkpoint(work_dir, step, model, optimizer, sampler, events, cfg, scal
         temp = path.with_name('.' + path.name + '-' + uuid.uuid4().hex + '.tmp')
         temp.mkdir(parents=True)
         state = dict(model=model.state_dict(), optimizer=optimizer.state_dict(), sampler=sampler.state_dict(),
+                     optimizer_type=optimizer_name(optimizer),
                      global_step=step, events=dict(events), rng=rng_state(), config=dict(cfg),
                      scaler=scaler.state_dict() if scaler is not None else None)
         with (temp / 'state.pt').open('wb') as stream:
@@ -64,13 +66,16 @@ def load_checkpoint(path, model, optimizer=None, sampler=None, cfg=None, scaler=
     # These are self-owned complete training snapshots, including Python/NumPy RNG state.
     state = torch.load(Path(path) / 'state.pt', map_location='cpu', weights_only=False)
     if cfg is not None:
-        for name in ('image_shape', 'model', 'loss', 'optimizer', 'precision', 'deterministic'):
+        for name in ('image_shape', 'model', 'loss', 'optimizer', 'precision', 'deterministic', 'renderer'):
             if state['config'].get(name) != cfg.get(name):
                 raise ValueError('Checkpoint configuration differs for ' + name + '; use a separate work_dir')
         if optimizer is not None:
             for name in ('max_steps', 'validate_every_steps', 'mini_every_n_validations'):
                 if state['config']['training'][name] != cfg['training'][name]:
                     raise ValueError('Resume schedule differs for ' + name + '; use a separate work_dir')
+    if optimizer is not None and state.get('optimizer_type') is not None:
+        if state['optimizer_type'] != optimizer_name(optimizer):
+            raise ValueError('Checkpoint optimizer type differs; start in a separate work_dir')
     model.load_state_dict(state['model'], strict=True)
     if optimizer is not None:
         optimizer.load_state_dict(state['optimizer'])

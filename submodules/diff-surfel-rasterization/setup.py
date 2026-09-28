@@ -12,7 +12,18 @@
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
+import hashlib
+from pathlib import Path
 os.path.dirname(os.path.abspath(__file__))
+
+source_root = Path(__file__).resolve().parent
+build_sources = sorted(
+    list((source_root / 'cuda_rasterizer').glob('*.h')) +
+    list((source_root / 'cuda_rasterizer').glob('*.cu')) +
+    [source_root / name for name in ('ext.cpp', 'rasterize_points.cu', 'rasterize_points.h')])
+source_digest = hashlib.sha256(b''.join(
+    str(path.relative_to(source_root)).encode() + b'\0' + path.read_bytes()
+    for path in build_sources)).hexdigest()
 
 setup(
     name="diff_surfel_rasterization",
@@ -27,7 +38,9 @@ setup(
             "cuda_rasterizer/backward.cu",
             "rasterize_points.cu",
             "ext.cpp"],
-            extra_compile_args={"nvcc": ["-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/")]})
+            extra_compile_args={
+                "cxx": ['-DAABB_BACKWARD_SOURCE_SHA256="' + source_digest + '"'],
+                "nvcc": ["-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/")]})
         ],
     cmdclass={
         'build_ext': BuildExtension

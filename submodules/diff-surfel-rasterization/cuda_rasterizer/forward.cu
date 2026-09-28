@@ -219,7 +219,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// the effective extent is now depended on the opacity of gaussian.
 	float cutoff = sqrtf(max(9.f + 2.f * logf(opacities[idx]), 0.000001));
 #else
-	float cutoff = 3.0f;
+	float cutoff = AABB_CUTOFF;
 #endif
 
 	// Compute center and radius

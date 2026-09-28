@@ -6,8 +6,29 @@ import torch
 class SurfelRenderer:
     def __init__(self, cfg):
         self.cfg = cfg
+        self._backend_checked = False
+
+    def validate_backend(self):
+        required = self.cfg.get('aabb_backward_version', 0)
+        if required and not self._backend_checked:
+            from diff_surfel_rasterization import _C
+            actual = getattr(_C, 'aabb_backward_version', 0)
+            if actual != required:
+                raise RuntimeError(
+                    f'Rasterizer AABB backward version {actual}, required {required}. '
+                    'Rebuild in the drivingrecon environment: '
+                    'pip install -e submodules/diff-surfel-rasterization --no-build-isolation')
+        self._backend_checked = True
+
+    def backend_info(self):
+        from diff_surfel_rasterization import _C
+        self.validate_backend()
+        return dict(extension_path=_C.__file__,
+                    aabb_backward_version=getattr(_C, 'aabb_backward_version', 0),
+                    source_sha256=getattr(_C, 'aabb_backward_source_sha256', None))
 
     def render_view(self, gaussians, camera, depth=False):
+        self.validate_backend()
         from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
         means = gaussians['means'][0].float().contiguous()
         with torch.autocast(device_type=means.device.type, enabled=False):

@@ -11,6 +11,10 @@
 
 #include "backward.h"
 #include "auxiliary.h"
+#include "aabb_math.h"
+#if TIGHTBBOX
+#error "AABB center backward requires the fixed cutoff; opacity-dependent bounds need their own VJP."
+#endif
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -514,30 +518,16 @@ __device__ void compute_transmat_aabb(
 	float3 dL_dmean2D = dL_dmean2Ds[idx];
 	if(dL_dmean2D.x != 0 || dL_dmean2D.y != 0)
 	{
-		const float distance = T[2].x * T[2].x + T[2].y * T[2].y - T[2].z * T[2].z;
-		const float f = 1 / (distance);
-		const float dpx_dT00 =  f * T[2].x;
-		const float dpx_dT01 =  f * T[2].y;
-		const float dpx_dT02 = -f * T[2].z;
-		const float dpy_dT10 =  f * T[2].x;
-		const float dpy_dT11 =  f * T[2].y;
-		const float dpy_dT12 = -f * T[2].z;
-		const float dpx_dT30 =  T[0].x * (f - 2 * f * f * T[2].x * T[2].x);
-		const float dpx_dT31 =  T[0].y * (f - 2 * f * f * T[2].y * T[2].y);
-		const float dpx_dT32 = -T[0].z * (f + 2 * f * f * T[2].z * T[2].z);
-		const float dpy_dT30 =  T[1].x * (f - 2 * f * f * T[2].x * T[2].x);
-		const float dpy_dT31 =  T[1].y * (f - 2 * f * f * T[2].y * T[2].y);
-		const float dpy_dT32 = -T[1].z * (f + 2 * f * f * T[2].z * T[2].z);
-
-		dL_dT[0].x += dL_dmean2D.x * dpx_dT00;
-		dL_dT[0].y += dL_dmean2D.x * dpx_dT01;
-		dL_dT[0].z += dL_dmean2D.x * dpx_dT02;
-		dL_dT[1].x += dL_dmean2D.y * dpy_dT10;
-		dL_dT[1].y += dL_dmean2D.y * dpy_dT11;
-		dL_dT[1].z += dL_dmean2D.y * dpy_dT12;
-		dL_dT[2].x += dL_dmean2D.x * dpx_dT30 + dL_dmean2D.y * dpy_dT30;
-		dL_dT[2].y += dL_dmean2D.x * dpx_dT31 + dL_dmean2D.y * dpy_dT31;
-		dL_dT[2].z += dL_dmean2D.x * dpx_dT32 + dL_dmean2D.y * dpy_dT32;
+		// Differentiate the SAME center used by compute_aabb, including its
+		// cutoff squared and all cross terms from the quotient denominator.
+		const float matrix[9] = {
+			T[0].x, T[0].y, T[0].z, T[1].x, T[1].y, T[1].z,
+			T[2].x, T[2].y, T[2].z};
+		float center_gradient[9] = {};
+		aabb_center_vjp(matrix, AABB_CUTOFF * AABB_CUTOFF,
+			dL_dmean2D.x, dL_dmean2D.y, center_gradient);
+		for (int i = 0; i < 9; ++i)
+			dL_dT[i / 3][i % 3] += center_gradient[i];
 
 		if (Ts_precomp != nullptr) {
 			dL_dTs[idx * 9 + 0] = dL_dT[0].x;

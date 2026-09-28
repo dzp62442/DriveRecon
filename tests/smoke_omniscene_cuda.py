@@ -24,6 +24,7 @@ from comp_svfgs.dataset_omniscene import OmniSceneDataset
 from comp_svfgs.evaluation import Evaluator
 from comp_svfgs.metrics import ImageMetrics, load_lpips
 from comp_svfgs.model import StaticDriveRecon, parameter_counts
+from comp_svfgs.optimizer import build_optimizer
 from comp_svfgs.renderer import SurfelRenderer
 from comp_svfgs.runtime import atomic_json, move_to_device
 from comp_svfgs.sampler import ResumableBatchSampler
@@ -78,8 +79,7 @@ def main():
         cfg.dump(str(root/'resolved_config.py'))
         torch.manual_seed(0)
         model = StaticDriveRecon(cfg.model)
-        optimizer = torch.optim.Adam(model.optimizer_groups(cfg.optimizer), lr=cfg.optimizer.lr,
-                                      eps=cfg.optimizer.eps, betas=cfg.optimizer.betas)
+        optimizer = build_optimizer(model.optimizer_groups(cfg.optimizer), cfg.optimizer)
         model, optimizer = accelerator.prepare(model, optimizer)
         renderer = SurfelRenderer(cfg.renderer)
         check_native_depth(renderer, accelerator.device)

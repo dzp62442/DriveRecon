@@ -27,7 +27,7 @@ def run():
     log = root/'run/metrics.jsonl'
     records = [json.loads(line) for line in log.read_text().splitlines()]
     kinds = [row['kind'] for row in records]
-    assert kinds == ['train', 'validation', 'mini_periodic', 'mini_final'], kinds
+    assert kinds == ['train', 'health', 'validation', 'mini_periodic', 'mini_final'], kinds
     main(common+['--mode', 'train'])
     assert [json.loads(line) for line in log.read_text().splitlines()] == records
     main(common+['--mode', 'test', '--test-split', 'total', '--checkpoint', 'final'])
