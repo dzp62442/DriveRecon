@@ -43,6 +43,8 @@ dist/
 /wandb/
 /work_dirs/
 /datasets/omniscene
+/datasets/PandaSet
+/datasets/DDAD
 /test/*.ply
 *.log
 events.out.tfevents.*

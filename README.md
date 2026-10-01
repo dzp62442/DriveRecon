@@ -53,6 +53,19 @@ CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/112x
 CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/omniscene/224x400.py --mode test --test-split total --checkpoint final
 ```
 
+### PandaSet / DDAD 零样本泛化实验
+
+```bash
+python train_cross_dataset.py --config configs/zero_shot/omniscene_to_ddad_112x200.py --print-config
+
+CUDA_VISIBLE_DEVICES=0 python train_cross_dataset.py --config configs/zero_shot/omniscene_to_pandaset_112x200.py --mode test --test-split total
+CUDA_VISIBLE_DEVICES=0 python train_cross_dataset.py --config configs/zero_shot/omniscene_to_ddad_112x200.py --mode test --test-split total
+
+# DDAD 默认只在 12 个新视角排除自车遮挡；显式关闭后输出至独立的 full_image 子目录。
+CUDA_VISIBLE_DEVICES=0 python train_cross_dataset.py --config configs/zero_shot/omniscene_to_ddad_112x200.py --mode test --test-split total --cfg-options evaluation.eval_use_ego_mask=False
+```
+
+默认源权重为 `work_dirs/omniscene/driverecon_static_t1_112x200/checkpoints/step-00100001`，可用 `--checkpoint <完整检查点目录>` 覆写。
 
 ### Preparing Dataset
 Follow detailed instructions in [Prepare Dataset](docs/prepare_data.md). 
