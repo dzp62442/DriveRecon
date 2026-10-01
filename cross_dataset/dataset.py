@@ -14,6 +14,13 @@ from .io import read_view
 
 PROTOCOL = 'novel18_s10_d1p6_min0p1'
 
+# DDAD's prepared reference is forward/left/up; OmniScene uses right/forward/up.
+# This changes the common frame, not the camera-local OpenCV axes or metric scale.
+DDAD_REFERENCE_TO_MODEL = ((0., -1., 0., 0.),
+                           (1., 0., 0., 0.),
+                           (0., 0., 1., 0.),
+                           (0., 0., 0., 1.))
+
 
 def pixel_protocol(enabled):
     return 'ddad_ego_novel12_v1' if enabled else 'full_image'
@@ -49,10 +56,14 @@ class CrossDataset(Dataset):
         return len(self.bin_tokens)
 
     def evaluation_metadata(self):
-        return dict(dataset=self.name, dataset_split=self.split, test_range=self.test_range,
-                    processed_root=str(self.processed_root), view_protocol=PROTOCOL,
-                    pixel_protocol=pixel_protocol(self.ego_masks is not None),
-                    eval_mask=self.ego_masks.metadata() if self.ego_masks is not None else None)
+        metadata = dict(dataset=self.name, dataset_split=self.split, test_range=self.test_range,
+                        processed_root=str(self.processed_root), view_protocol=PROTOCOL,
+                        pixel_protocol=pixel_protocol(self.ego_masks is not None),
+                        eval_mask=self.ego_masks.metadata() if self.ego_masks is not None else None)
+        if self.name == 'ddad':
+            metadata.update(camera_frame='nuscenes_axes_x_right_y_forward_z_up',
+                            reference_to_model=[list(row) for row in DDAD_REFERENCE_TO_MODEL])
+        return metadata
 
     def __getitem__(self, index):
         token = self.bin_tokens[index]
@@ -63,6 +74,12 @@ class CrossDataset(Dataset):
         # Centers supply training depth or evaluation reference; neither is a new model input.
         centers = [read_view(v, self.processed_root, self.shape, depth=True) for v in center_infos]
         novel = [read_view(v, self.processed_root, self.shape, depth=not self.supervision) for v in novel_infos]
+        if self.name == 'ddad':
+            reference_to_model = centers[0]['extrinsics'].new_tensor(DDAD_REFERENCE_TO_MODEL)
+            # Rotate R and t together, once per view, before reusing centers as targets.
+            # Model backprojection and render cameras derive all geometry from these c2w.
+            for view in centers + novel:
+                view['extrinsics'] = reference_to_model @ view['extrinsics']
         camera_keys = ('image', 'intrinsics', 'intrinsics_pixel', 'extrinsics')
         context = stack_views([{k: v[k] for k in camera_keys} for v in centers])
         keys = camera_keys if self.supervision else camera_keys + ('metric_depth',)

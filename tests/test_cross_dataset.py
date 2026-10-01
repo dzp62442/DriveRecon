@@ -70,8 +70,9 @@ class DataTests(unittest.TestCase):
                 k = data['context']['intrinsics_pixel'][0]
                 self.assertEqual(float(k[0, 0]), 30.*shape[1]/48)
                 self.assertEqual(float(k[1, 2]), 15.*shape[0]/32)
-                # The OpenCV axes stay unflipped.
-                torch.testing.assert_close(data['context']['extrinsics'][0], torch.eye(4))
+                # DDAD's common frame changes; camera-local OpenCV axes stay intact.
+                torch.testing.assert_close(data['context']['extrinsics'][0], torch.tensor(
+                    [[0., -1., 0., 0.], [1., 0., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]]))
                 self.assertNotIn('metric_depth', data['context'])
                 self.assertNotIn('segmentation_label', data['context'])
                 self.assertAlmostEqual(float(data['target']['metric_depth'].mean()), 30., places=4)

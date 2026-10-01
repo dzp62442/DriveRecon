@@ -132,9 +132,27 @@ mini 规模沿用新数据集在 SVF-GS 的 100-bin 协议，不套用 OmniScene
 
 RGB 使用已有 `images_small` 的 224×400 图像，转换为 `[0,1]` RGB。112×200 以 PIL bilinear 缩放，224×400 直接使用；同时按实际缩放比例缩放 `params_small` 中的 `camera_intrinsic` 前两行。保留当前分辨率的像素 K，以及分别除以 W、H 的归一化 K。
 
-`sensor2lidar_transform` 已将每张相机图像映射到该 bin 的中央参考坐标系；字段名含 lidar 不表示需要读取 LiDAR 数据。本项目的模型、反投影与 renderer 使用 **OpenCV 相机坐标约定**，因此直接使用这个矩阵作为 `extrinsics`。SVF-GS 的 `camera_tensors()` 另乘 `diag(1,-1,-1,1)` 是为其 OpenGL 接口服务，不能照搬到 DriveRecon，也不复用其 half-pixel 射线构造。
+`sensor2lidar_transform` 将相机局部坐标映射到该 bin 的中央参考坐标系；字段名含 lidar 不表示需要读取 LiDAR 数据。相机局部均保留 **OpenCV 坐标约定**，但公共参考系需要区分数据集：PandaSet 沿用现有外参；DDAD 预处理使用 **X 向前、Y 向左、Z 向上**，须在加载边界转换到 OmniScene / nuScenes 训练使用的 **X 向右、Y 向前、Z 向上**。不能由“相机局部约定相同”推断“公共坐标也相同”。
+
+DDAD 的全部输入和目标外参统一左乘下式，即 `(x, y, z) → (-y, x, z)`，同时转换 `R` 和 `t`：
+
+```text
+B = [[ 0, -1,  0,  0],
+     [ 1,  0,  0,  0],
+     [ 0,  0,  1,  0],
+     [ 0,  0,  0,  1]]
+c2w_model = B @ sensor2lidar_transform
+R_model = B[:3, :3] @ R_prepared
+t_model = B[:3, :3] @ t_prepared
+```
+
+转换在 `CrossDataset.__getitem__()` 中、组装 context/target 之前完成；中央六路只转换一次，再复用为目标最后六路。DDAD 的 train/val/test、mini/total、两档分辨率和自车掩码开关均走同一路径。相对位姿、相机局部射线、像素投影和米制深度保持不变；公共坐标下的射线方向、相机中心、模型反投影位置，以及渲染所需的逆外参和组合投影矩阵，均由转换后的外参在既有路径中计算，没有另一份需要手工更新的几何缓存。网络的几何位置融合会使用这些公共坐标，不能假定其对公共坐标旋转不敏感。
+
+SVF-GS 的 `camera_tensors()` 另乘 `diag(1,-1,-1,1)` 是为其 OpenGL 接口服务，不能照搬到 DriveRecon，也不复用其 half-pixel 射线构造。DDAD 公共坐标对齐不改变相机局部 OpenCV 约定。
 
 继续调用既有 `comp_svfgs.camera.target_cameras`、模型内反投影和原生 surfel renderer；不修改原相机投影公式、不移动场景原点、不归一化位移尺度。
+
+既有预处理资产保留 DDAD 原始参考系，无需重新预处理。DDAD 评估元数据新增 `camera_frame=nuscenes_axes_x_right_y_forward_z_up` 与 `reference_to_model` 记录加载后的坐标约定；协议、启动指令、实验名和输出路径保持原样。旧 DDAD 结果由用户清理后按原命令重新评估，本次修复不删除或改写实验结果，不涉及模型原有 bug。
 
 ### 4.4 深度、静态标签和 batch
 
@@ -145,7 +163,7 @@ Metric3D-v2 的 `depth_path` 已是米制深度。读取后按 SVF-GS 的 PIL fl
 | 字段 | 单样本形状/用途 |
 | --- | --- |
 | `context.image` | `[6,3,H,W]`，唯一 RGB 网络输入 |
-| `context.extrinsics` | `[6,4,4]`，OpenCV 相机到中央参考系 |
+| `context.extrinsics` | `[6,4,4]`，OpenCV 相机到中央参考系；DDAD 已统一为 nuScenes 公共轴 |
 | `context.intrinsics_pixel` / `intrinsics` | `[6,3,3]`，像素/归一化 K |
 | `context.metric_depth` | train/val 的 `[6,H,W]` 米制辅助监督；零样本重建不需要 |
 | `context.segmentation_label` | train/val 中创建全 0 的 `[6,H,W]` 静态类别标签，不读取掩码文件 |
@@ -386,3 +404,19 @@ PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES=0 python tests/smoke_cross_datase
 该脚本在两数据集、两档分辨率各做一个 bin 的功能检查，包括三组评估、DDAD mask 开关、一次诊断更新、验证及完整状态保存/恢复，不发送通知。112×200 使用真实 OmniScene 权重；224×400 仅使用随机初始化检查接口，不能视为零样本泛化结果。训练接口的真实数据检查使用明确标记的 val 样本，不生成或冒充目标域 train 索引。
 
 PCC 或其他数学上未定义的数值在 CSV 中保留，在 JSON 中沿用原 `atomic_json` 的显式字符串表示（如 `"nan"`），不丢弃该 bin、不转成好分数。正式报告仍需运行第 9 节的全量命令；上述 CPU 检查不是实际 CUDA 渲染结果或测速结果。
+
+## 13. DDAD 公共坐标对齐修复（2026-10-01）
+
+核对 VolSplat 的 DDAD 修复、SVF-GS 预处理代码以及本项目加载路径后，确认此前也遗漏了第 4.3 节的公共坐标对齐。真实样本的前相机光轴在 DDAD 预处理参考系中约为 `(0.99768, 0.06738, -0.00935)`，转换后为 `(-0.06738, 0.99768, -0.00935)`；作为方向约定参照，读取的 OmniScene 训练样本约为 `(0.00954, 0.99978, 0.01854)`。各数据集的实际相机安装角不同，无需让这些数值完全相等。
+
+运行逻辑仅修改 `cross_dataset/dataset.py`：DDAD 的所有输入、目标相机同步转换旋转和平移，并记录加载坐标元数据。模型几何分支、高斯中心反投影和渲染相机继续使用现有代码，从转换后的外参计算派生量；不修改模型、渲染器、其他数据集或指标实现，也不处理原模型其他 bug。
+
+| 检查 | 结果 |
+| --- | --- |
+| CPU 回归 | 48 项全部通过，新增 3 项覆盖旋转/平移、中央视角复用、各加载分支、派生几何和坐标元数据 |
+| 合成几何 | 两档分辨率，train/val/test、mini/total、自车掩码开关均覆盖；6 输入及 18 目标外参只转换一次；相对位姿与像素投影保持一致 |
+| 真实资产加载 | PandaSet/DDAD 各取一个 bin，覆盖两档分辨率与可用的 val/test、mini/total、掩码开关，共 16 组；与修改前加载器对照，RGB、内参、深度、标签、掩码和划分不变，PandaSet 的全部输出不变；没有扫描或审查全量数据 |
+| 真实派生几何 | 相对位姿最大绝对差 `3.58e-7`；反投影位置与预期公共坐标转换的最大差为 `0`；相同三维点的齐次渲染投影最大差 `2.86e-6`，均在 float32 误差范围内 |
+| 修改范围 | 原入口、模型、相机、渲染器、配置和 README 等 1,611 个已跟踪文件相对本次修改前内容未变 |
+
+本次检查全部使用 CPU，输出位于 `/tmp/driverecon-ddad-frame-sBB55p2i/`，没有运行训练或正式推理，也未删除、改写已有结果。上述检查证明加载与几何的一致性，不代表修复后的指标；用户清理旧 DDAD 零样本结果后，继续使用原命令、原实验名重新评估即可。DDAD 自车掩码仍默认开启，关闭方式不变。
