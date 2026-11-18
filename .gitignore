@@ -42,6 +42,7 @@ dist/
 /runs/
 /wandb/
 /work_dirs/
+work_dirs
 /datasets/omniscene
 /datasets/PandaSet
 /datasets/DDAD
